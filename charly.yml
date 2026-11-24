@@ -903,43 +903,16 @@ check-kde-cstream-browser:
                   kdotool windowmove "$w" 0 0
                   kdotool windowsize "$w" 1920 1000
                 in_container: true
-            # The pointer/axis path fails while the KEYBOARD path through the SAME control
-            # channel works, so the question is which half drops it: does the element RECEIVE
-            # the GstNavigation event at all? The element logs every event it does not handle
-            # as "Unhandled event: …", so this check reports the streamer's own lines for both
-            # (charly-streamer#23) — data for the next run instead of another guess.
-            - check: what the element did with the pointer and the wheel is reported
-              id: browser-navigation-log
-              stage: wheel-aim
+            # Declarative: the streamer writes its own output (pod-cstream's service declares
+            # `stdout:`), so a bed step only has to assert the file is there and non-empty.
+            # No supervisorctl, no grep, no inline shell (opencharly/pod-kde-cstream#2).
+            - check: the streamer wrote its own log, so a crash would have been recorded
+              id: browser-streamer-log
+              stage: verify
               context: [runtime]
-              command:
-                command: |
-                  # TEMPORARY EVIDENCE CARRIER (pod-kde-cstream#2): the runner records a FAILING
-                  # check's stderr in summary.yml, and that is this bed's only channel for a
-                  # command's output (a passing check's stdout is discarded; `command:` checks
-                  # have no artifact field). Revert to exit 0 once the log lines are captured.
-                  # summary.yml TRUNCATES a failing check's reason (~200 chars, measured), so
-                  # everything below is deliberately SHORT and ordered by importance. The
-                  # decisive signal from run 2026.327.2201 was `uptime 0:00:58` three minutes
-                  # into the live phase: the streamer RESTARTED mid-session, which kills the
-                  # WebRTC session the wheel stages depend on.
-                  {
-                    echo "up=$(supervisorctl status cstream-streamer 2>&1 | tr -s ' ')"
-                    # summary.yml truncates a reason at ~200 chars: ONE line, ANSI stripped,
-                    # that names the exit. The captured log is 31 KB (measured 2026-11-24).
-                    echo "last=$(tail -20 /tmp/cstream-streamer.out 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -vE '^$' | tail -1 | cut -c1-120)"
-                    echo "errs=$(grep -icE 'error|exit|shutdown|SIG' /tmp/cstream-streamer.out 2>/dev/null)"
-                    echo "sup=$(grep 'cstream-streamer' /tmp/supervisord.log 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-170)"
-                    for f in /var/log/supervisor/supervisord.log /tmp/supervisord.log /var/log/supervisord.log; do
-                      if [ -f "$f" ]; then
-                        echo "suplog=$f"
-                        grep 'cstream-streamer' "$f" | tail -2 | cut -c1-95
-                        break
-                      fi
-                    done
-                  } >&2
-                  exit 1
-              exit_status: 0
+              file:
+                file: /tmp/cstream-streamer.out
+                exists: true
             - check: the browser's pointer reached wev, and wev has seen NO axis event yet
               id: browser-wheel-absent
               stage: wheel-aim
@@ -1065,22 +1038,6 @@ check-kde-cstream-browser:
                 # run is self-explaining: the PNG's dimensions, its exact byte count and a hash.
                 # A 1920x1080 PNG of ~11 KB is a near-flat frame; the hash tells whether two
                 # runs captured the SAME frame (deterministic) or merely the same size.
-                # A DIAGNOSTIC MUST NEVER BE A RED STEP (it was, in run 2026.327.1837: it
-                # asserted `file`'s output and `file`/`stat` produced nothing in that image).
-                # Coreutils only, everything on stdout, and the only assertion is that the
-                # header line was printed.
-                - check: the screenshot's shape is reported, so a failing capture explains itself
-                  id: browser-screenshot-shape
-                  stage: browser
-                  context: [runtime]
-                  command:
-                    command: |
-                      f=/tmp/check-kde-cstream-browser.png
-                      echo "bytes=$(wc -c < "$f" 2>&1)"
-                      echo "magic=$(od -An -tx1 -N8 "$f" 2>&1 | tr -d ' \n')"
-                  exit_status: 0
-                  stdout:
-                      - contains: bytes=
                 - agent-check: the browser screenshot shows the KDE Plasma desktop being streamed (wallpaper and panel), not a login form, a black frame or an error
                   stage: browser
                 - run: the browser types the command into the desktop through the page
