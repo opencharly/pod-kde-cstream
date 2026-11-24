@@ -1031,13 +1031,25 @@ check-kde-cstream-browser:
                     method: screenshot
                     tab: "1"
                     artifact: /tmp/check-kde-cstream-browser.png
+                    # NO byte floor beyond a truncated-write guard, and the reason is measured.
+                    # A byte count measures COMPRESSIBILITY, not content: `Page.captureScreenshot`
+                    # returns the 780x493 browser viewport, and the same correctly-captured desktop
+                    # compressed to 11 354 bytes when it was a dark frame and 244 063 when it was a
+                    # bright one (measured on the identical artifact path, 2026-11-24T08:19Z: 1 459
+                    # distinct colours, 80.6% black). A 20 000-byte floor therefore failed a
+                    # perfectly good capture and reported it as "the page shows no desktop".
+                    # `artifact_not_uniform` is the assertion that actually measures "a desktop is
+                    # there"; the byte count belongs in the diagnostic below, where it explains a
+                    # failure instead of causing one.
                     artifact_not_uniform: true
-                    artifact_min_bytes: 20000
+                    artifact_min_bytes: 1000
                 # When the screenshot assertion fails, its message says only "size N < min_bytes"
                 # — it cannot say WHAT was captured. This check reports the shape so the next
                 # run is self-explaining: the PNG's dimensions, its exact byte count and a hash.
-                # A 1920x1080 PNG of ~11 KB is a near-flat frame; the hash tells whether two
-                # runs captured the SAME frame (deterministic) or merely the same size.
+                # Measured shape of a FAILING capture (2026-11-24T08:19Z): 780x493 — the BROWSER
+                # VIEWPORT, not the 1920x1080 stream — with 1 459 distinct colours, so byte count
+                # never characterised it and dimensions do. The hash tells whether two runs
+                # captured the SAME frame or merely the same size.
                 - agent-check: the browser screenshot shows the KDE Plasma desktop being streamed (wallpaper and panel), not a login form, a black frame or an error
                   stage: browser
                 - run: the browser types the command into the desktop through the page
