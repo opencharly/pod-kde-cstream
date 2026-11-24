@@ -1086,33 +1086,47 @@ check-kde-cstream-browser:
                 # toplevels map, so a move that stays inside its geometry produces no
                 # enter. Park the pointer BELOW wev (which spans y=0..1000) first, so the
                 # next move onto it IS a transition.
+                # THE POINTER MOVES ARE DISPATCHED AS DOM EVENTS, not through `cdp: raw`.
+                # Measured (opencharly/plugin-cdp#13): `raw` + Input.dispatchMouseEvent produces NO
+                # page mousemove at all -- an instrumented element counted zero mouse events from
+                # these steps across a whole session, while 68 key events from `cdp: type` arrived
+                # through the same channel. A DOM MouseEvent on the video goes through the SAME page
+                # listener the browser's real pointer would, so the chain under test is unchanged;
+                # only the way the event is delivered is. When plugin-cdp#13 is fixed, these can go
+                # back to `raw`.
                 - run: the browser parks its pointer below the observer, so the next move crosses onto it
                   id: browser-wheel-park
                   stage: wheel-aim
                   context: [runtime]
                   cdp:
-                    method: raw
+                    method: eval
                     tab: "1"
-                    http_method: Input.dispatchMouseEvent
-                    params: '{"type":"mouseMoved","x":200,"y":1050}'
+                    expression: "(() => { const v=document.getElementById('screen'); v.dispatchEvent(new MouseEvent('mousemove',{clientX:200,clientY:1050,bubbles:true})); return 'PARKED'; })()"
+                  stdout:
+                      - contains: PARKED
                 - run: the browser moves its real mouse over the stream's upper area
                   id: browser-wheel-aim
                   stage: wheel-aim
                   context: [runtime]
                   cdp:
-                    method: raw
+                    method: eval
                     tab: "1"
-                    http_method: Input.dispatchMouseEvent
-                    params: '{"type":"mouseMoved","x":200,"y":200}'
+                    expression: "(() => { const v=document.getElementById('screen'); v.dispatchEvent(new MouseEvent('mousemove',{clientX:200,clientY:200,bubbles:true})); return 'AIMED'; })()"
+                  stdout:
+                      - contains: AIMED
                 - run: the browser turns its real wheel one notch down (a DOM deltaY of 100 px)
                   id: browser-wheel-send
                   stage: wheel-reached
                   context: [runtime]
+                  # A DOM WheelEvent, for the same reason as the park/aim moves above
+                  # (opencharly/plugin-cdp#13): `raw` delivers no page event. deltaMode 0 = pixels,
+                  # and 100 px is one notch in Chromium -- exactly what the old `deltaY: 100` meant.
                   cdp:
-                    method: raw
+                    method: eval
                     tab: "1"
-                    http_method: Input.dispatchMouseEvent
-                    params: '{"type":"mouseWheel","x":200,"y":200,"deltaX":0,"deltaY":100}'
+                    expression: "(() => { const v=document.getElementById('screen'); v.dispatchEvent(new WheelEvent('wheel',{clientX:200,clientY:200,deltaX:0,deltaY:100,deltaMode:0,bubbles:true,cancelable:true})); return 'WHEEL-SENT'; })()"
+                  stdout:
+                      - contains: WHEEL-SENT
 
 kde-cstream-skill:
     skill:
