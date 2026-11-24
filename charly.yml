@@ -1,0 +1,1162 @@
+#  opencharly/pod-kde-cstream — a fullscreen, GPU-accelerated KDE Plasma desktop streamed
+#  to a browser over cstream (WebRTC), on the CDI pod base.
+#
+#    cstream-streamer (pod-cstream) ── IS the Wayland parent (waylanddisplaysrc, wayland-1)
+#        ├─ KWin (pod-kde-nested, --socket wayland-kde) configured at the full output size
+#        │     └─ plasmashell + KDE applications
+#        └─ NVENC (nvidia) or VA-API (amdgpu/intel) encode -> webrtcsink
+#    cstream-gateway :8080 ── the browser player, PAM login, authenticated signalling
+#
+#  The GPU reaches the image from the HOST through CDI (pod-cdi composes layer-cdi and never
+#  bakes a driver): KWin composites with OpenGL ES on it, and the streamer encodes on it --
+#  NVENC through the CDI-injected libcuda/libnvidia-encode on an NVIDIA node, VA-API on an
+#  AMD/Intel node. The render node is charly's DRINODE unless the deployment sets
+#  CSTREAM_RENDER_NODE.
+
+import:
+    # A builder map does NOT cross a namespace boundary: a box composed here declares its
+    # own (kdotool, via layer-kde-shell, is an AUR package). Same pins as pod-kde-vnc.
+    - arch: '@github.com/opencharly/distro-arch:v2026.326.1455'
+    - podcdi: '@github.com/opencharly/pod-cdi:v2026.326.1530'
+    # The headless Chrome DRIVER box the browser bed's chrome member runs.
+    - fedora: '@github.com/opencharly/distro-fedora:v2026.325.1900'
+
+kde-cstream-session:
+    candy:
+        description: |
+            KDE Plasma as the cstream desktop: composes the cstream server (pod-cstream --
+            the streamer that IS the Wayland parent, the gateway, PAM, audio) and the nested
+            Plasma session (pod-kde-nested), and points the nested KWin at the streamer's
+            own compositor: host socket wayland-1 in the streamer's runtime dir
+            /tmp/cstream-rt, KWin serving wayland-kde, Plasma on the pod's shared session
+            bus. No sway and no kiosk rule: the streamer's compositor configures its one
+            toplevel at the full output size, so KWin is fullscreen by construction. Every
+            claim is observable at runtime: the streamer, gateway and Plasma services
+            RUNNING, KWin's single output at the stream's size, and Plasma's shell on the
+            bus.
+        # COMPOSITION, not `require:`: the transport and the desktop are what this candy
+        # IS, so they are `candy:` members (the metalayer form); a require-only candy has
+        # nothing of its own to install and charly rejects it.
+        candy:
+            - '@github.com/opencharly/pod-cstream:v2026.314.0717'
+            - '@github.com/opencharly/pod-kde-nested:v2026.326.2127'
+        require:
+            # plugin-cstream serves the `cstream:` verb, plugin-dbus the `dbus:` verb this
+            # pod's checks author.
+            - '@github.com/opencharly/plugin-cstream/candy/plugin-cstream:v2026.325.1242'
+            - '@github.com/opencharly/plugin-dbus/candy/plugin-dbus:v2026.314.0712'
+        env:
+            KDE_NESTED_HOST_DISPLAY: wayland-1
+            KDE_NESTED_RUNTIME_DIR: /tmp/cstream-rt
+            KDE_NESTED_SOCKET: wayland-kde
+            KDE_NESTED_BUS: session
+        plan:
+            - check: the streamer, the gateway and the nested Plasma session are all RUNNING
+              id: kde-cstream-services
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 3s
+              exit_status: 0
+              stdout:
+                  - equals: RUNNING
+              command:
+                command: supervisorctl status cstream-streamer cstream-gateway kde-nested | awk '{print $2}' | sort -u
+                in_container: true
+            - check: Plasma's shell is on the session bus the deployment shares
+              id: kde-cstream-plasmashell-on-bus
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 3s
+              dbus: list
+              stdout:
+                  - contains: org.kde.plasmashell
+
+kde-cstream:
+    candy:
+        description: |
+            The pod-kde-cstream image: a fullscreen, GPU-accelerated KDE Plasma desktop
+            streamed to a browser over cstream/WebRTC on :8080, built on the CDI GPU pod
+            base (opencharly/pod-cdi), so the GPU driver comes from the host and none is
+            baked in.
+        base: podcdi.pod-cdi
+        platform:
+            - linux/amd64
+        build:
+            - pac
+        builder:
+            aur: arch.arch-builder
+            cargo: arch.arch-builder
+            npm: arch.arch-builder
+            pixi: arch.arch-builder
+        candy:
+            - kde-cstream-session
+        plan:
+            - check: no host-side nvidia-ctk is baked into the image (the CDI pod contract)
+              id: kde-cstream-no-nvidia-ctk
+              exit_status: 0
+              command: "! command -v nvidia-ctk"
+            - check: the stream's input client and the browser player ship in the image
+              id: kde-cstream-input-client
+              exit_status: 0
+              command: test -x /usr/local/bin/cstream-input && test -x /usr/local/bin/cstream-gateway && echo CLIENTS-OK
+              stdout:
+                  - contains: CLIENTS-OK
+
+# The image the beds deploy: kde-cstream plus BED-ONLY fixtures, never shipped -- the
+# probe account's password is in the clear by design, and the verb's venue probes are
+# test tooling.
+kde-cstream-check:
+    candy:
+        description: |
+            Bed-only image: kde-cstream plus the cstream: verb's venue probes and a probe
+            account with a known password. Deployed only by this repo's disposable beds.
+        base: kde-cstream
+        platform:
+            - linux/amd64
+        build:
+            - pac
+        candy:
+            - '@github.com/opencharly/plugin-cstream/candy/cstream-probes:v2026.325.1242'
+            - '@github.com/opencharly/plugin-cstream/candy/cstream-probe-account:v2026.325.1242'
+            - kde-cstream-wheel-observer
+
+# wev: the Wayland client that observes what a pointer axis event delivers, so the
+# wheel is asserted at a real client, not at an intermediate layer. Bed-only.
+kde-cstream-wheel-observer:
+    candy:
+        description: |
+            BED FIXTURE ONLY: wev, the Wayland event viewer, as the client the beds'
+            wheel steps observe. It logs every wl_pointer.axis it receives with its
+            direction and its v120 value, which is the evidence that a wheel sent
+            through the stream reached a KDE client with the right sign and size.
+        package:
+            - wev
+        plan:
+            - check: wev, the beds' axis observer, is installed
+              id: wheel-observer-installed
+              file:
+                file: /usr/bin/wev
+                exists: true
+
+# Disposable R10 bed: builds the stack, deploys it, and proves the whole chain on the
+# pod -- the stream serves, KWin is nested fullscreen and renders on the GPU, the
+# streamer encodes in hardware, frames pulled back through WebRTC show Plasma, PAM
+# refuses a wrong password, and input sent through the stream reaches a Plasma app.
+check-kde-cstream-pod:
+    pod:
+        image: kde-cstream-check
+        disposable: true
+        lifecycle: dev
+        description: >-
+            Sole proof that pod-kde-cstream serves a fullscreen, hardware-accelerated KDE
+            Plasma desktop over cstream: the streamer, gateway and Plasma services run; KWin
+            nests in the streamer's compositor at the full output size and composites with
+            OpenGL on the GPU (not llvmpipe); the streamer reports a hardware encoder; a
+            frame decoded through the WebRTC track shows the desktop and changes when a
+            window maps; PAM accepts the probe account and refuses a wrong password; and
+            keys sent through the stream's control channel run a command in a Konsole.
+        add_candy:
+            # The verbs the steps below author. Pinned so the host check runner can reach
+            # each plugin's manifest (the scalar `cstream: status` sugar is read from it).
+            - '@github.com/opencharly/plugin-cstream/candy/plugin-cstream:v2026.325.1242'
+            - '@github.com/opencharly/plugin-dbus/candy/plugin-dbus:v2026.314.0712'
+        plan:
+            - check: the gateway is ready, and the streamer reports the HARDWARE encoder it opened
+              id: bed-gateway-ready-hardware
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              cstream: status
+              stdout:
+                  - contains: '"ready":true'
+                  - contains: '"encoder":"hardware:'
+            - check: KWin composites with hardware OpenGL, not the llvmpipe software rasterizer
+              id: bed-kwin-gpu
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 3s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Compositing Type: OpenGL"
+                  - matches: "OpenGL renderer string: (NVIDIA|AMD|Intel|Radeon)"
+                  - not_contains: llvmpipe
+            - check: KWin's one output is the stream's full 1920x1080 -- Plasma is fullscreen in the stream
+              id: bed-kwin-fullscreen
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 3s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,1920x1080"
+            - check: a frame pulled back THROUGH the WebRTC track is a full, non-uniform 1920x1080 picture of the desktop
+              id: bed-stream-frame
+              context: [runtime]
+              eventually: 90s
+              retry_interval: 10s
+              cstream:
+                method: frame
+                artifact: /tmp/check-kde-cstream-pod-frame.jpg
+                artifact_min_dimensions: 1920x1080
+                artifact_not_uniform: true
+            - agent-check: the frame decoded from the stream shows a fullscreen KDE Plasma desktop (wallpaper and the panel along the bottom), not a black, gray or letterboxed frame
+            - check: PAM accepts the probe account through the real session leader
+              id: bed-login-accept
+              context: [runtime]
+              cstream:
+                method: login
+                user: user
+                password: cstream-bed-pw
+                expect: accept
+              stdout:
+                  - contains: LOGIN-ACCEPTED
+            - check: PAM refuses a wrong password for the same account
+              id: bed-login-reject
+              context: [runtime]
+              cstream:
+                method: login
+                user: user
+                password: not-the-password
+                expect: reject
+              stdout:
+                  - contains: LOGIN-REJECTED
+            # The desktop at every size, live (the operator's requirement: it must work at
+            # all resolutions and resize on the fly). Each size: the exact size applies (sizes
+            # are fitted only to the encoder's own limits and to even dimensions), the
+            # stream's frames carry it, KWin's output follows it, and a pointer move lands on
+            # the exact pixel -- the FIRST move after the resize, which also proves the
+            # pointer is not lost on a refocus. Portrait, 4K, a non-multiple-of-8 and a
+            # 1366-wide size are all real browser windows. It ends back at 1920x1080.
+            - run: resize the stream to 1366x768
+              id: bed-size-1366x768
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 1366 768\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 1366x768"
+            - check: the stream's frames are 1366x768
+              id: bed-size-1366x768-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 1366"
+                  - contains: "Height: 768"
+            - check: KWin's output followed the stream to 1366x768
+              id: bed-size-1366x768-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,1366x768"
+            - run: the pointer moves to the far corner of the 1366x768 desktop through the stream
+              id: bed-size-1366x768-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 1359
+                y: 763
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 1366x768 desktop
+              id: bed-size-1366x768-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:1359 y:763"
+            - run: resize the stream to 390x844
+              id: bed-size-390x844
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 390 844\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 390x844"
+            - check: the stream's frames are 390x844
+              id: bed-size-390x844-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 390"
+                  - contains: "Height: 844"
+            - check: KWin's output followed the stream to 390x844
+              id: bed-size-390x844-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,390x844"
+            - run: the pointer moves to the far corner of the 390x844 desktop through the stream
+              id: bed-size-390x844-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 383
+                y: 839
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 390x844 desktop
+              id: bed-size-390x844-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:383 y:839"
+            - run: resize the stream to 3840x2160
+              id: bed-size-3840x2160
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 3840 2160\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 3840x2160"
+            - check: the stream's frames are 3840x2160
+              id: bed-size-3840x2160-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 3840"
+                  - contains: "Height: 2160"
+            - check: KWin's output followed the stream to 3840x2160
+              id: bed-size-3840x2160-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,3840x2160"
+            - run: the pointer moves to the far corner of the 3840x2160 desktop through the stream
+              id: bed-size-3840x2160-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 3833
+                y: 2155
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 3840x2160 desktop
+              id: bed-size-3840x2160-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:3833 y:2155"
+            - run: resize the stream to 1918x1078
+              id: bed-size-1918x1078
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 1918 1078\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 1918x1078"
+            - check: the stream's frames are 1918x1078
+              id: bed-size-1918x1078-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 1918"
+                  - contains: "Height: 1078"
+            - check: KWin's output followed the stream to 1918x1078
+              id: bed-size-1918x1078-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,1918x1078"
+            - run: the pointer moves to the far corner of the 1918x1078 desktop through the stream
+              id: bed-size-1918x1078-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 1911
+                y: 1073
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 1918x1078 desktop
+              id: bed-size-1918x1078-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:1911 y:1073"
+            - run: resize the stream to 800x600
+              id: bed-size-800x600
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 800 600\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 800x600"
+            - check: the stream's frames are 800x600
+              id: bed-size-800x600-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 800"
+                  - contains: "Height: 600"
+            - check: KWin's output followed the stream to 800x600
+              id: bed-size-800x600-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,800x600"
+            - run: the pointer moves to the far corner of the 800x600 desktop through the stream
+              id: bed-size-800x600-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 793
+                y: 595
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 800x600 desktop
+              id: bed-size-800x600-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:793 y:595"
+            - run: resize the stream to 1920x1080
+              id: bed-size-1920x1080
+              context: [runtime]
+              # The control socket refuses a second resize within 500 ms; the bound keeps a
+              # dead socket failing.
+              eventually: 15s
+              retry_interval: 1s
+              command:
+                command: printf 'resize 1920 1080\n' | timeout 10 socat - UNIX-CONNECT:/tmp/cstream-control.sock
+                in_container: true
+              stdout:
+                  - contains: "OK resize 1920x1080"
+            - check: the stream's frames are 1920x1080
+              id: bed-size-1920x1080-frames
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: |
+                  f=$(ls -t /tmp/cstream-frames/*.jpg 2>/dev/null | head -1)
+                  test -n "$f" || exit 1
+                  gst-discoverer-1.0 "$f" | tr -s ' ' | grep -E 'Width|Height'
+                in_container: true
+              stdout:
+                  - contains: "Width: 1920"
+                  - contains: "Height: 1080"
+            - check: KWin's output followed the stream to 1920x1080
+              id: bed-size-1920x1080-kwin
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              dbus:
+                method: call
+                dest: org.kde.KWin
+                path: /KWin
+                member: org.kde.KWin.supportInformation
+              stdout:
+                  - contains: "Geometry: 0,0,1920x1080"
+            - run: the pointer moves to the far corner of the 1920x1080 desktop through the stream
+              id: bed-size-1920x1080-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 1913
+                y: 1075
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's pointer is on that exact pixel of the 1920x1080 desktop
+              id: bed-size-1920x1080-pointer-landed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+              stdout:
+                  - contains: "x:1913 y:1075"
+            # The streaming gate: a window maps on the streamer's own compositor (the parent),
+            # the stream must change, and the window goes away again. The input steps below
+            # then prove the desktop got its keyboard and pointer back (a closing parent
+            # window used to strand focus on it: opencharly/gst-wayland-display, toplevel_destroyed).
+            - run: the streaming gate -- the stream changes when a client maps on the streamer's own compositor
+              id: bed-stream-live
+              context: [runtime]
+              timeout: 180s
+              command:
+                command: /usr/local/bin/stream-probe
+                in_container: true
+              stdout:
+                  - contains: STREAM-LIVE-OK
+            - check: before any input, the marker the typed command creates does not exist
+              id: bed-input-absent
+              context: [runtime]
+              file:
+                file: /tmp/kde-cstream-input-ok
+                exists: false
+            # The input sequence is authored as the bed's own `check:` steps: a bed's
+            # `run:` steps are verify-only in its check-live stage (skipped), so a
+            # mutation the bed needs must live in a check step (/charly-check:check).
+            - run: a Konsole is launched inside the Plasma session
+              id: bed-open-konsole
+              context: [runtime]
+              command:
+                command: |
+                  WAYLAND_DISPLAY=wayland-kde XDG_RUNTIME_DIR=/tmp/cstream-rt setsid konsole >/dev/null 2>&1 < /dev/null &
+                  echo launched
+                in_container: true
+              exit_status: 0
+            # The sync primitive for "keystrokes will reach Konsole": KWin itself reports
+            # Konsole as its ACTIVE window (kdotool, over KWin's D-Bus scripting), polled
+            # under a bounded window -- no fixed delay.
+            - check: KWin reports the Konsole as its active window, so input sent through the stream reaches it
+              id: bed-konsole-focused
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 2s
+              exit_status: 0
+              stdout:
+                  - contains: Konsole
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getactivewindow getwindowname
+                in_container: true
+            - run: a command is typed into the Konsole through the stream's control channel
+              id: bed-stream-type
+              context: [runtime]
+              cstream:
+                method: type
+                text: touch /tmp/kde-cstream-input-ok
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - run: Return is pressed through the stream
+              id: bed-stream-return
+              context: [runtime]
+              cstream:
+                method: key
+                key: Return
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: the command typed through the stream ran inside the pod (WebRTC -> webrtcsink -> waylanddisplaysrc -> KWin -> Konsole)
+              id: bed-input-reached-plasma
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              file:
+                file: /tmp/kde-cstream-input-ok
+                exists: true
+            - run: a pointer move sent through the stream lands where KWin puts its cursor
+              id: bed-stream-pointer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 700
+                y: 400
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: KWin's cursor is at the position the stream sent
+              id: bed-pointer-reached-kwin
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              exit_status: 0
+              stdout:
+                  - contains: "x:700 y:400"
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getmouselocation
+                in_container: true
+            # The wheel (opencharly/gst-wayland-display#8), end to end at a real client: wev
+            # logs Wayland's one-notch-down as `axis: 0 (vertical), value120: 120`. A wrong
+            # sign gives -120, a wrong scale another number, a missing link nothing.
+            - run: wev, the axis observer, starts as a client of the nested KWin
+              id: bed-wheel-observer
+              context: [runtime]
+              command:
+                command: |
+                  WAYLAND_DISPLAY=wayland-kde XDG_RUNTIME_DIR=/tmp/cstream-rt setsid wev > /tmp/wev.log 2>&1 < /dev/null &
+                  echo launched
+                in_container: true
+            - run: wev is placed at a known geometry, so the stream can point at it
+              id: bed-wheel-observer-place
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 2s
+              command:
+                command: |
+                  export KDE_SESSION_VERSION=6
+                  w=$(kdotool search --class wev | head -1)
+                  test -n "$w" || exit 1
+                  kdotool windowmove "$w" 100 100
+                  kdotool windowsize "$w" 600 400
+                in_container: true
+            - check: wev is at 100,100 and 600x400
+              id: bed-wheel-observer-placed
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getwindowgeometry $(KDE_SESSION_VERSION=6 kdotool search --class wev | head -1)
+                in_container: true
+              stdout:
+                  - contains: "Position: 100,100"
+                  - contains: "Geometry: 600x400"
+            - run: the pointer moves onto wev through the stream
+              id: bed-wheel-pointer-on-observer
+              context: [runtime]
+              cstream:
+                method: move
+                x: 400
+                y: 300
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: before any wheel input, wev has the pointer and has seen NO axis event
+              id: bed-wheel-absent
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: grep -q 'wl_pointer\] enter' /tmp/wev.log && ! grep -q axis /tmp/wev.log
+                in_container: true
+            - run: one wheel notch down is sent through the stream (120 per notch, positive = up)
+              id: bed-wheel-sent
+              context: [runtime]
+              cstream:
+                method: scroll
+                x: 400
+                y: 300
+                delta_x: 0
+                delta_y: -120
+              stdout:
+                  - contains: CSTREAM-INPUT-DELIVERED
+            - check: wev received exactly Wayland's one notch down -- the stream's wheel reached a KDE client with the right sign and size
+              id: bed-wheel-reached-client
+              context: [runtime]
+              eventually: 20s
+              retry_interval: 2s
+              command:
+                command: grep 'axis_value120' /tmp/wev.log
+                in_container: true
+              stdout:
+                  - contains: "axis: 0 (vertical), value120: 120"
+
+# Disposable R10 bed: a REAL browser (headless Google Chrome, a sibling member on the
+# shared charly network) logs in to the gateway, plays the stream, and types into the
+# desktop through the page -- the path a person uses, end to end.
+#
+# The subject pod plus a chrome sibling member, ordered by `stage:` (stage groups run in
+# first-seen order; within a stage, steps on different members run concurrently,
+# same-member steps keep authored order).
+#
+# THE ORDER LAW, which is why the marker-absence check below carries `stage: browser`:
+# a stage group's POSITION is where its NAME is first seen in the walk, and the root node
+# is walked before its members. A group named only in the chrome member (`browser` was)
+# therefore lands AFTER every group the subject names -- so `verify` and the wheel groups
+# ran while the page was still on its LOGIN FORM, and `browser-viewer-counted` read
+# `"viewers":0` correctly and failed the bed (opencharly/charly-streamer#22). Naming the
+# group in the root plan puts the browser phase where it belongs:
+#   setup   -- the subject launches a Konsole while chrome opens the player
+#   browser -- chrome logs in, plays and types through the page; the subject asserts its
+#              marker is absent before that
+#   verify  -- the subject asserts the gateway counted a viewer while it played, the
+#              command the browser typed ran, and the gateway kept one pid
+#   wheel-* -- the pointer and the axis round trip
+check-kde-cstream-browser:
+    pod:
+        image: kde-cstream-check
+        disposable: true
+        lifecycle: dev
+        description: >-
+            Sole proof that a browser can use pod-kde-cstream: headless Chrome is refused
+            the signalling socket without a session, is refused by PAM on a wrong password,
+            logs in with the probe account, plays a live 1920x1080 H.264 stream whose
+            decoded frame count keeps rising, shows the Plasma desktop, and types a command
+            into a Konsole through the page that then runs inside the pod.
+        add_candy:
+            - '@github.com/opencharly/plugin-cstream/candy/plugin-cstream:v2026.325.1242'
+            - '@github.com/opencharly/plugin-cdp/candy/plugin-cdp:v2026.314.1533'
+        plan:
+            - check: the gateway is ready, and the streamer reports the HARDWARE encoder it opened
+              id: browser-gateway-ready
+              stage: setup
+              context: [runtime]
+              eventually: 120s
+              retry_interval: 5s
+              cstream: status
+              stdout:
+                  - contains: '"ready":true'
+                  - contains: '"encoder":"hardware:'
+            - check: before any input, the marker the browser will create does not exist
+              id: browser-input-absent
+              # `browser`, not `setup`, and that is the FIX, not a label: this is the root
+              # node's only browser-phase step, and naming the group here is what makes the
+              # whole browser phase run BEFORE `verify` (see THE ORDER LAW above).
+              stage: browser
+              context: [runtime]
+              file:
+                file: /tmp/kde-cstream-browser-ok
+                exists: false
+            - run: a Konsole is launched inside the Plasma session
+              id: browser-open-konsole
+              stage: setup
+              context: [runtime]
+              command:
+                command: |
+                  WAYLAND_DISPLAY=wayland-kde XDG_RUNTIME_DIR=/tmp/cstream-rt setsid konsole >/dev/null 2>&1 < /dev/null &
+                  echo launched
+                in_container: true
+              exit_status: 0
+            - check: KWin reports the Konsole as its active window
+              id: browser-konsole-focused
+              stage: setup
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 2s
+              exit_status: 0
+              stdout:
+                  - contains: Konsole
+              command:
+                command: KDE_SESSION_VERSION=6 kdotool getactivewindow getwindowname
+                in_container: true
+            # The gateway has its own uptime check; the STREAMER had none, and run
+            # 2026.327.2201 caught it at `uptime 0:00:58` three minutes into the live phase —
+            # a restart that kills the WebRTC session the wheel stages then rely on.
+            # Measuring UPTIME was wrong: services are ordered by priority (dbus 2 →
+            # pipewire 5 → broker 8 → streamer), so a young streamer at verify is the
+            # SCHEDULE, not a restart (measured 2026-11-24; the earlier FATAL belonged to the
+            # OLD pin d72b448, not to this tree). What matters is that it is not in a failed
+            # state and that its own output carries no fatal.
+            - check: the streamer is healthy at the end of the session -- RUNNING, and no fatal in its own log
+              id: browser-streamer-health
+              stage: verify
+              context: [runtime]
+              command:
+                command: |
+                  st=$(supervisorctl status cstream-streamer 2>&1 | tr -s ' ')
+                  echo "status: $st"
+                  echo "$st" | grep -q ' RUNNING ' || exit 1
+                  if [ -f /tmp/cstream-streamer.out ]; then
+                    n=$(grep -ciE 'fatal|panic' /tmp/cstream-streamer.out)
+                    test "$n" -eq 0 || { echo "fatal lines in the streamer log: $n"; exit 1; }
+                  fi
+                  echo "streamer healthy"
+              exit_status: 0
+              stdout:
+                  - contains: streamer healthy
+            - check: the gateway stayed up for the whole session, so its in-memory session count is meaningful
+              id: browser-gateway-uptime
+              # The failure REASON carries supervisor's own uptime string, so a restart is
+              # visible in the run log: a crash-looping gateway zeroes `viewers` silently.
+              stage: verify
+              context: [runtime]
+              exit_status: 0
+              command:
+                command: supervisorctl status cstream-gateway
+                in_container: true
+              stdout:
+                  - matches: 'RUNNING\s+pid [0-9]+, uptime [0-9]+:'
+            - check: the gateway counts the browser as a viewer while it plays
+              id: browser-viewer-counted
+              # stage: verify runs on the SUBJECT pod's venue (the same venue as
+              # browser-input-reached-plasma). In the browser stage the probe resolves
+              # against the chrome member, which has no :8080 port mapping.
+              stage: verify
+              context: [runtime]
+              eventually: 180s
+              retry_interval: 3s
+              cstream: status
+              stdout:
+                  - contains: '"viewers":1'
+            - check: the browser's typing ran inside the pod (Chrome -> data channel -> webrtcsink -> waylanddisplaysrc -> KWin -> Konsole)
+              id: browser-input-reached-plasma
+              stage: verify
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 2s
+              file:
+                file: /tmp/kde-cstream-browser-ok
+                exists: true
+            # The wheel from a real browser: Chrome's own wheel event -> the player's
+            # wheelDeltas -> the control channel -> waylanddisplaysrc -> KWin -> wev. wev
+            # covers the desktop above the panel, so any point in the video's upper area
+            # maps onto it whatever the viewport (the player scales and clamps), and the
+            # absence step's `wl_pointer] enter` proves the pointer is really on it.
+            - run: wev, the axis observer, starts as a client of the nested KWin
+              id: browser-wheel-observer
+              stage: wheel-observe
+              context: [runtime]
+              command:
+                command: |
+                  WAYLAND_DISPLAY=wayland-kde XDG_RUNTIME_DIR=/tmp/cstream-rt setsid wev > /tmp/wev-browser.log 2>&1 < /dev/null &
+                  echo launched
+                in_container: true
+            - run: wev covers the desktop above the panel
+              id: browser-wheel-observer-place
+              stage: wheel-observe
+              context: [runtime]
+              eventually: 60s
+              retry_interval: 2s
+              command:
+                command: |
+                  export KDE_SESSION_VERSION=6
+                  w=$(kdotool search --class wev | head -1)
+                  test -n "$w" || exit 1
+                  kdotool windowmove "$w" 0 0
+                  kdotool windowsize "$w" 1920 1000
+                in_container: true
+            # The pointer/axis path fails while the KEYBOARD path through the SAME control
+            # channel works, so the question is which half drops it: does the element RECEIVE
+            # the GstNavigation event at all? The element logs every event it does not handle
+            # as "Unhandled event: …", so this check reports the streamer's own lines for both
+            # (charly-streamer#23) — data for the next run instead of another guess.
+            - check: what the element did with the pointer and the wheel is reported
+              id: browser-navigation-log
+              stage: wheel-aim
+              context: [runtime]
+              command:
+                command: |
+                  # TEMPORARY EVIDENCE CARRIER (pod-kde-cstream#2): the runner records a FAILING
+                  # check's stderr in summary.yml, and that is this bed's only channel for a
+                  # command's output (a passing check's stdout is discarded; `command:` checks
+                  # have no artifact field). Revert to exit 0 once the log lines are captured.
+                  # summary.yml TRUNCATES a failing check's reason (~200 chars, measured), so
+                  # everything below is deliberately SHORT and ordered by importance. The
+                  # decisive signal from run 2026.327.2201 was `uptime 0:00:58` three minutes
+                  # into the live phase: the streamer RESTARTED mid-session, which kills the
+                  # WebRTC session the wheel stages depend on.
+                  {
+                    echo "up=$(supervisorctl status cstream-streamer 2>&1 | tr -s ' ')"
+                    # summary.yml truncates a reason at ~200 chars: ONE line, ANSI stripped,
+                    # that names the exit. The captured log is 31 KB (measured 2026-11-24).
+                    echo "last=$(tail -20 /tmp/cstream-streamer.out 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -vE '^$' | tail -1 | cut -c1-120)"
+                    echo "errs=$(grep -icE 'error|exit|shutdown|SIG' /tmp/cstream-streamer.out 2>/dev/null)"
+                    echo "sup=$(grep 'cstream-streamer' /tmp/supervisord.log 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-170)"
+                    for f in /var/log/supervisor/supervisord.log /tmp/supervisord.log /var/log/supervisord.log; do
+                      if [ -f "$f" ]; then
+                        echo "suplog=$f"
+                        grep 'cstream-streamer' "$f" | tail -2 | cut -c1-95
+                        break
+                      fi
+                    done
+                  } >&2
+                  exit 1
+              exit_status: 0
+            - check: the browser's pointer reached wev, and wev has seen NO axis event yet
+              id: browser-wheel-absent
+              stage: wheel-aim
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: grep -q 'wl_pointer\] enter' /tmp/wev-browser.log && ! grep -q axis /tmp/wev-browser.log
+                in_container: true
+            - check: wev received exactly Wayland's one notch down from the browser's wheel -- right sign, right size
+              id: browser-wheel-reached-client
+              stage: wheel-reached
+              context: [runtime]
+              eventually: 30s
+              retry_interval: 2s
+              command:
+                command: grep 'axis_value120' /tmp/wev-browser.log
+                in_container: true
+              stdout:
+                  - contains: "axis: 0 (vertical), value120: 120"
+    kde-cstream-chrome:
+        pod:
+            image: fedora.chrome-headless
+            plan:
+                - check: the signalling socket refuses a browser with no session
+                  id: browser-signalling-refused
+                  stage: setup
+                  context: [runtime]
+                  eventually: 180s
+                  retry_interval: 5s
+                  exit_status: 0
+                  stdout:
+                      - contains: "401"
+                  command:
+                    command: curl -s -o /dev/null -w '%{http_code}' http://${HOST:check-kde-cstream-browser}:8080/signalling
+                    in_container: true
+                - run: Chrome opens the gateway's player
+                  id: browser-open
+                  stage: setup
+                  context: [runtime]
+                  eventually: 60s
+                  retry_interval: 3s
+                  cdp:
+                    method: open
+                    url: http://${HOST:check-kde-cstream-browser}:8080/
+                - check: the player shows its login form
+                  id: browser-login-form
+                  stage: setup
+                  context: [runtime]
+                  timeout: 60s
+                  cdp:
+                    method: wait
+                    tab: "1"
+                    selector: "#login-form"
+                - run: a wrong password is submitted through the form
+                  id: browser-bad-password-typed
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: eval
+                    tab: "1"
+                    expression: "document.getElementById('login-user').value='user'; document.getElementById('login-password').value='not-the-password'; document.getElementById('login-submit').click(); 'submitted'"
+                  stdout:
+                      - contains: submitted
+                - check: PAM's refusal reaches the browser and no session starts
+                  id: browser-bad-password-refused
+                  stage: browser
+                  context: [runtime]
+                  eventually: 30s
+                  retry_interval: 2s
+                  cdp:
+                    method: eval
+                    tab: "1"
+                    expression: "document.body.dataset.state + ' ' + document.getElementById('login-error').textContent"
+                  stdout:
+                      - contains: "login Login refused."
+                - run: the probe account logs in through the form
+                  id: browser-login
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: eval
+                    tab: "1"
+                    expression: "document.getElementById('login-password').value='cstream-bed-pw'; document.getElementById('login-submit').click(); 'submitted'"
+                  stdout:
+                      - contains: submitted
+                - check: the stream plays in the page at the desktop's full size
+                  id: browser-playing
+                  stage: browser
+                  context: [runtime]
+                  eventually: 90s
+                  retry_interval: 3s
+                  cdp:
+                    method: eval
+                    tab: "1"
+                    expression: "document.body.dataset.state + ' ' + document.getElementById('screen').videoWidth + 'x' + document.getElementById('screen').videoHeight"
+                  stdout:
+                      - contains: "playing 1920x1080"
+                - check: frames keep arriving -- the decoded frame count rises between two reads
+                  id: browser-live-frames
+                  stage: browser
+                  context: [runtime]
+                  eventually: 30s
+                  retry_interval: 2s
+                  cdp:
+                    method: eval
+                    tab: "1"
+                    expression: "(async () => { const q = () => document.getElementById('screen').getVideoPlaybackQuality().totalVideoFrames; const a = q(); await new Promise(r => setTimeout(r, 1500)); const b = q(); return (b > a ? 'FRAMES-RISING ' : 'FRAMES-STUCK ') + a + '->' + b; })()"
+                  stdout:
+                      - contains: FRAMES-RISING
+                - check: the page shows the desktop -- a non-uniform screenshot of the playing player
+                  id: browser-screenshot
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: screenshot
+                    tab: "1"
+                    artifact: /tmp/check-kde-cstream-browser.png
+                    artifact_not_uniform: true
+                    artifact_min_bytes: 20000
+                # When the screenshot assertion fails, its message says only "size N < min_bytes"
+                # — it cannot say WHAT was captured. This check reports the shape so the next
+                # run is self-explaining: the PNG's dimensions, its exact byte count and a hash.
+                # A 1920x1080 PNG of ~11 KB is a near-flat frame; the hash tells whether two
+                # runs captured the SAME frame (deterministic) or merely the same size.
+                # A DIAGNOSTIC MUST NEVER BE A RED STEP (it was, in run 2026.327.1837: it
+                # asserted `file`'s output and `file`/`stat` produced nothing in that image).
+                # Coreutils only, everything on stdout, and the only assertion is that the
+                # header line was printed.
+                - check: the screenshot's shape is reported, so a failing capture explains itself
+                  id: browser-screenshot-shape
+                  stage: browser
+                  context: [runtime]
+                  command:
+                    command: |
+                      f=/tmp/check-kde-cstream-browser.png
+                      echo "bytes=$(wc -c < "$f" 2>&1)"
+                      echo "magic=$(od -An -tx1 -N8 "$f" 2>&1 | tr -d ' \n')"
+                  exit_status: 0
+                  stdout:
+                      - contains: bytes=
+                - agent-check: the browser screenshot shows the KDE Plasma desktop being streamed (wallpaper and panel), not a login form, a black frame or an error
+                  stage: browser
+                - run: the browser types the command into the desktop through the page
+                  id: browser-type
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: type
+                    tab: "1"
+                    selector: "#screen"
+                    text: touch /tmp/kde-cstream-browser-ok
+                - run: the browser presses Return through the page
+                  id: browser-return
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: raw
+                    tab: "1"
+                    http_method: Input.dispatchKeyEvent
+                    params: '{"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}'
+                - run: the browser releases Return
+                  id: browser-return-up
+                  stage: browser
+                  context: [runtime]
+                  cdp:
+                    method: raw
+                    tab: "1"
+                    http_method: Input.dispatchKeyEvent
+                    params: '{"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}'
+                # THE POINTER-FOCUS TRANSITION (opencharly/charly-streamer#23). The
+                # compositor resolves pointer focus once, at the toplevel map, and smithay
+                # emits wl_pointer.enter ONLY on a focus TRANSITION — a client whose
+                # wl_pointer attaches later never receives one. wev starts after the
+                # toplevels map, so a move that stays inside its geometry produces no
+                # enter. Park the pointer BELOW wev (which spans y=0..1000) first, so the
+                # next move onto it IS a transition.
+                - run: the browser parks its pointer below the observer, so the next move crosses onto it
+                  id: browser-wheel-park
+                  stage: wheel-aim
+                  context: [runtime]
+                  cdp:
+                    method: raw
+                    tab: "1"
+                    http_method: Input.dispatchMouseEvent
+                    params: '{"type":"mouseMoved","x":200,"y":1050}'
+                - run: the browser moves its real mouse over the stream's upper area
+                  id: browser-wheel-aim
+                  stage: wheel-aim
+                  context: [runtime]
+                  cdp:
+                    method: raw
+                    tab: "1"
+                    http_method: Input.dispatchMouseEvent
+                    params: '{"type":"mouseMoved","x":200,"y":200}'
+                - run: the browser turns its real wheel one notch down (a DOM deltaY of 100 px)
+                  id: browser-wheel-send
+                  stage: wheel-reached
+                  context: [runtime]
+                  cdp:
+                    method: raw
+                    tab: "1"
+                    http_method: Input.dispatchMouseEvent
+                    params: '{"type":"mouseWheel","x":200,"y":200,"deltaX":0,"deltaY":100}'
+
+kde-cstream-skill:
+    skill:
+        name: kde-cstream
+        family: selkies
+        owner: kde-cstream-session
+        description: |-
+            The pod-kde-cstream GPU pod: a fullscreen, hardware-accelerated KDE Plasma desktop streamed to a browser over cstream/WebRTC (:8080), on the CDI pod base.
+            MUST be invoked before building, deploying, configuring or troubleshooting the kde-cstream image, its kde-cstream-session candy, or the check-kde-cstream-pod / check-kde-cstream-browser beds.
+        triggers:
+            - pod-kde-cstream
+            - kde-cstream
+            - check-kde-cstream-pod
+            - check-kde-cstream-browser
+            - KDE Plasma streamed over cstream
+            - cstream desktop in a browser
